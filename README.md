@@ -2,17 +2,19 @@
 
 PanSou是一个高性能的网盘资源搜索API服务，支持TG搜索和自定义插件搜索。系统设计以性能和可扩展性为核心，支持并发搜索、结果智能排序和网盘类型分类。
 
-[//]: # (MCP服务文档: [MCP-SERVICE.md]&#40;docs/MCP-SERVICE.md&#41;)
-
-
 ## 特性（[详见系统设计文档](docs/%E7%B3%BB%E7%BB%9F%E5%BC%80%E5%8F%91%E8%AE%BE%E8%AE%A1%E6%96%87%E6%A1%A3.md)）
 
 - **高性能搜索**：并发执行多个TG频道及异步插件搜索，显著提升搜索速度；工作池设计，高效管理并发任务
 - **网盘类型分类**：自动识别多种网盘链接，按类型归类展示
 - **智能排序**：基于插件等级、时间新鲜度和优先关键词的多维度综合排序算法
-- **异步插件系统**：支持通过插件扩展搜索来源，支持"尽快响应，持续处理"的异步搜索模式，解决了某些搜索源响应时间长的问题。详情参考[**插件开发指南**](docs/插件开发指南.md)
+- **异步插件系统**：支持通过插件扩展搜索来源，支持"尽快响应，持续处理"的异步搜索模式，解决了某些搜索源响应时间长的问题。详情参考[**插件开发指南**](docs/插件开发指南.md)，AI 辅助开发可参考[**PanSou 插件开发 Skill 使用说明**](docs/AI客户端使用PanSou插件开发Skill指南.md)
 - **二级缓存**：分片内存+分片磁盘缓存机制，大幅提升重复查询速度和并发性能  
 
+## 开发者文档
+
+- [插件开发指南](docs/插件开发指南.md)：PanSou 插件接口、异步机制、优先级、过滤策略和开发流程。
+- [PanSou 插件开发 Skill 使用说明](docs/AI客户端使用PanSou插件开发Skill指南.md)：在 Codex、Claude、Cursor、Windsurf、Copilot Chat、Cline/Roo Code 等 AI 客户端中复用插件开发规则。
+- [PanSou 插件开发 Skill 原文](docs/pansou-plugin-developer-SKILL.md)：可直接安装到支持 Skill 的客户端，或作为项目规则引用。
 
 ## 支持的网盘类型
 
@@ -810,4 +812,4 @@ curl http://localhost:8888/api/health
 
 ## ⭐ Star 历史
 
-[![Star History Chart](https://api.star-history.com/svg?repos=fish2018/pansou&type=Date)](https://star-history.com/#fish2018/pansou&Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=fish2018/pansou&type=Date)](https://star-history.dera.page/#fish2018/pansou&Date)
