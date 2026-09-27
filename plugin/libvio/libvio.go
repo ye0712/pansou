@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"pansou/util"
 	"regexp"
 	"strings"
 	"sync"
@@ -199,7 +200,7 @@ func (p *LibvioPlugin) getResponseReader(resp *http.Response) (io.Reader, error)
 			return nil, fmt.Errorf("创建gzip reader失败: %w", err)
 		}
 		// 注意：不要在这里关闭gzReader，它需要在外部使用
-		reader = gzReader
+		reader = util.NewCappedReader(gzReader, util.MaxDecompressedBytes)
 	}
 
 	return reader, nil
@@ -237,7 +238,7 @@ func (p *LibvioPlugin) extractSearchResults(doc *goquery.Document, keyword strin
 		rating := strings.TrimSpace(s.Find(".pic-tag").Text())
 
 		// 从详情页路径提取ID（如：/detail/4095.html -> 4095）
-		idMatch := regexp.MustCompile(`/detail/(\d+)\.html`).FindStringSubmatch(detailPath)
+		idMatch := libvioRe1.FindStringSubmatch(detailPath)
 		resourceID := ""
 		if len(idMatch) > 1 {
 			resourceID = idMatch[1]
@@ -593,7 +594,7 @@ func (p *LibvioPlugin) fetchPanLink(client *http.Client, playURL string, referer
 	}
 
 	// 提取player_aaaa对象
-	playerDataRegex := regexp.MustCompile(`var\s+player_aaaa\s*=\s*({[^}]+})`)
+	playerDataRegex := libvioRe2
 	matches := playerDataRegex.FindStringSubmatch(string(body))
 
 	if len(matches) < 2 {
@@ -708,3 +709,10 @@ func (p *LibvioPlugin) mapPanType(from string, url string) string {
 func init() {
 	plugin.RegisterGlobalPlugin(NewLibvioPlugin())
 }
+
+// 以下正则原先在函数内临时编译，每次调用都要重新解析模式；
+// 提到包级后只编译一次，匹配行为不变。
+var (
+	libvioRe1 = regexp.MustCompile(`/detail/(\d+)\.html`)
+	libvioRe2 = regexp.MustCompile(`var\s+player_aaaa\s*=\s*({[^}]+})`)
+)

@@ -616,7 +616,7 @@ func (p *PanSearchAsyncPlugin) fetchFirstPage(keyword string, baseURL string, cl
 	}
 
 	// 读取响应体
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
 	if err != nil {
 		return nil, 0, fmt.Errorf("读取响应失败: %w", err)
 	}
@@ -675,7 +675,7 @@ func (p *PanSearchAsyncPlugin) fetchPage(keyword string, offset int, baseURL str
 	}
 
 	// 读取响应体
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
 	if err != nil {
 		return nil, fmt.Errorf("读取响应失败: %w", err)
 	}
@@ -728,7 +728,16 @@ func (p *PanSearchAsyncPlugin) convertResults(items []PanSearchItem, keyword str
 
 		var datetime time.Time
 		if item.Time != "" {
-			datetime, _ = time.Parse(time.RFC3339, item.Time)
+			// 解析失败原先被丢弃：结果时间戳变成零值，随后在按时间筛选时被**静默排除**，
+			// 表现为"这条资源明明有却搜不到"。这里换一个常见格式再试，仍失败则记录原因。
+			parseErr := error(nil)
+			datetime, parseErr = time.Parse(time.RFC3339, item.Time)
+			if parseErr != nil {
+				datetime, parseErr = time.Parse("2006-01-02 15:04:05", item.Time)
+			}
+			if parseErr != nil {
+				fmt.Printf("[PANSEARCH] 时间解析失败，该条目将按无时间处理: %q | %v\n", item.Time, parseErr)
+			}
 		}
 
 		result := model.SearchResult{

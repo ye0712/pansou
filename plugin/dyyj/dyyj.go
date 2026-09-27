@@ -2,13 +2,12 @@ package dyyj
 
 import (
 	"context"
-	encodingjson "encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
+	utiljson "pansou/util/json"
 	"regexp"
 	"strings"
 	"sync"
@@ -17,6 +16,7 @@ import (
 	"github.com/PuerkitoBio/goquery"
 	"pansou/model"
 	"pansou/plugin"
+	"pansou/util"
 )
 
 const (
@@ -110,6 +110,7 @@ func NewDyyjPlugin() *DyyjPlugin {
 // createOptimizedHTTPClient 创建优化的HTTP客户端（连接池配置）
 func createOptimizedHTTPClient() *http.Client {
 	transport := &http.Transport{
+		Proxy:                 util.ProxyFuncForTransport(),
 		MaxIdleConns:          MaxIdleConns,
 		MaxIdleConnsPerHost:   MaxIdleConnsPerHost,
 		MaxConnsPerHost:       MaxConnsPerHost,
@@ -271,7 +272,7 @@ func (p *DyyjPlugin) executeSearchHTML(client *http.Client, keyword string) ([]m
 	}
 
 	// 读取响应体用于调试
-	bodyBytes, err := io.ReadAll(resp.Body)
+	bodyBytes, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
 	if err != nil {
 		if p.debugMode {
 			log.Printf("[DYYJ] 读取响应体失败: %v", err)
@@ -425,7 +426,7 @@ func (p *DyyjPlugin) executeSearchAPI(client *http.Client, keyword string) ([]mo
 	defer resp.Body.Close()
 
 	var payload dyyjAPIResponse
-	if err := encodingjson.NewDecoder(resp.Body).Decode(&payload); err != nil {
+	if err := utiljson.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		return nil, fmt.Errorf("[%s] 解析 API 响应失败: %w", p.Name(), err)
 	}
 
@@ -491,8 +492,8 @@ func (p *DyyjPlugin) extractAPIContentLinks(contentHTML string) []model.Link {
 }
 
 func (p *DyyjPlugin) extractPasswordFromURLText(text string) string {
-	for _, pattern := range []string{`提取码[:：]?\\s*([A-Za-z0-9]{4,8})`, `密码[:：]?\\s*([A-Za-z0-9]{4,8})`, `pwd\\s*[=:：]\\s*([A-Za-z0-9]{4,8})`} {
-		if match := regexp.MustCompile(pattern).FindStringSubmatch(text); len(match) > 1 {
+	for _, re := range dyyjTextPasswordPatterns {
+		if match := re.FindStringSubmatch(text); len(match) > 1 {
 			return match[1]
 		}
 	}
@@ -987,7 +988,7 @@ func (p *DyyjPlugin) fetchDetailPageLinks(client *http.Client, detailURL string)
 	}
 
 	// 读取响应体
-	body, err := io.ReadAll(resp.Body)
+	body, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
 	if err != nil {
 		if p.debugMode {
 			log.Printf("[DYYJ] 读取详情页响应失败: %v (URL: %s)", err, detailURL)
@@ -1283,14 +1284,7 @@ func (p *DyyjPlugin) isNetworkDiskName(text string) bool {
 // extractPasswordFromURL 从URL中提取密码
 func (p *DyyjPlugin) extractPasswordFromURL(linkURL string) string {
 	// 从URL参数中提取密码
-	patterns := []string{
-		`[?&]pwd=([A-Za-z0-9]{4,8})`,
-		`[?&]password=([A-Za-z0-9]{4,8})`,
-		`[?&]code=([A-Za-z0-9]{4,8})`,
-	}
-
-	for _, pattern := range patterns {
-		re := regexp.MustCompile(pattern)
+	for _, re := range dyyjURLPasswordPatterns {
 		matches := re.FindStringSubmatch(linkURL)
 		if len(matches) > 1 {
 			return matches[1]
@@ -1332,4 +1326,18 @@ func (p *DyyjPlugin) determineCloudType(url string) string {
 	default:
 		return "others"
 	}
+}
+
+// dyyj 的密码提取模式：原先在函数内按 pattern 字符串逐个 MustCompile，
+// 每次调用都要重新解析模式，这里预编译为包级切片。
+var dyyjTextPasswordPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`提取码[:：]?\s*([A-Za-z0-9]{4,8})`),
+	regexp.MustCompile(`密码[:：]?\s*([A-Za-z0-9]{4,8})`),
+	regexp.MustCompile(`pwd\s*[=:：]\s*([A-Za-z0-9]{4,8})`),
+}
+
+var dyyjURLPasswordPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`[?&]pwd=([A-Za-z0-9]{4,8})`),
+	regexp.MustCompile(`[?&]password=([A-Za-z0-9]{4,8})`),
+	regexp.MustCompile(`[?&]code=([A-Za-z0-9]{4,8})`),
 }

@@ -3,7 +3,6 @@ package dy4k
 import (
 	"context"
 	"fmt"
-	"io"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -20,6 +19,7 @@ import (
 	"golang.org/x/net/proxy"
 	"pansou/model"
 	"pansou/plugin"
+	"pansou/util"
 )
 
 // 常量定义
@@ -132,6 +132,7 @@ type Dy4kPlugin struct {
 // createProxyTransport 创建支持代理的传输层
 func createProxyTransport(proxyURL string) (*http.Transport, error) {
 	transport := &http.Transport{
+		Proxy:               util.ProxyFuncForTransport(),
 		MaxIdleConns:        MaxIdleConns,
 		MaxIdleConnsPerHost: MaxIdleConnsPerHost,
 		MaxConnsPerHost:     MaxConnsPerHost,
@@ -416,7 +417,7 @@ func (p *Dy4kPlugin) searchPage(client *http.Client, encodedKeyword string, page
 	}
 
 	// 7. 读取并打印HTML响应
-	htmlBytes, err := io.ReadAll(resp.Body)
+	htmlBytes, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
 	if err != nil {
 		return nil, 0, fmt.Errorf("[%s] 第%d页读取响应失败: %w", p.Name(), page, err)
 	}
@@ -1042,7 +1043,7 @@ func (p *Dy4kPlugin) doRequestWithRetry(req *http.Request, client *http.Client) 
 
 		// 读取响应体以便调试
 		if resp.Body != nil {
-			bodyBytes, readErr := io.ReadAll(resp.Body)
+			bodyBytes, readErr := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
 			resp.Body.Close()
 			if readErr == nil && len(bodyBytes) > 0 {
 				bodyPreview := string(bodyBytes)

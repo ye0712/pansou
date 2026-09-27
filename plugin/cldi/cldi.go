@@ -3,9 +3,9 @@ package cldi
 import (
 	"context"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
+	"pansou/util"
 	"regexp"
 	"strings"
 	"sync"
@@ -152,7 +152,7 @@ func (p *CldiPlugin) searchPage(client *http.Client, keyword string, page int) (
 	}
 
 	// 读取响应
-	body, err := io.ReadAll(resp.Body)
+	body, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
 	if err != nil {
 		return nil, fmt.Errorf("[%s] 读取响应失败: %w", p.Name(), err)
 	}
@@ -199,7 +199,14 @@ func (p *CldiPlugin) doRequestWithRetry(req *http.Request, client *http.Client) 
 		}
 
 		if resp != nil {
+			status := resp.StatusCode
 			resp.Body.Close()
+			if err == nil {
+				// Do 成功但状态码非 200。此前这里只执行 lastErr = err，
+				// err 为 nil 时会把 lastErr 清空，三次失败后仅报出
+				// "%!w(<nil>)"，真实状态码被丢掉、无法定位失败原因。
+				err = fmt.Errorf("HTTP 状态码 %d", status)
+			}
 		}
 		lastErr = err
 	}
@@ -240,7 +247,7 @@ func (p *CldiPlugin) extractSearchResults(doc *goquery.Document) []model.SearchR
 				WorkTitle: title,
 			}},
 		}
-		if dateMatch := regexp.MustCompile(`添加时间[:：]\s*(\d{4}-\d{2}-\d{2})`).FindStringSubmatch(content); len(dateMatch) > 1 {
+		if dateMatch := cldiRe1.FindStringSubmatch(content); len(dateMatch) > 1 {
 			if parsed, err := time.ParseInLocation("2006-01-02", dateMatch[1], time.Local); err == nil {
 				result.Datetime = parsed
 			}
@@ -383,7 +390,14 @@ func (p *CldiPlugin) cleanTitle(title string) string {
 
 	// 清理多余的空格
 	cleaned = strings.TrimSpace(cleaned)
-	cleaned = regexp.MustCompile(`\s+`).ReplaceAllString(cleaned, " ")
+	cleaned = cldiRe2.ReplaceAllString(cleaned, " ")
 
 	return cleaned
 }
+
+// 以下正则原先在函数内临时编译，每次调用都要重新解析模式；
+// 提到包级后只编译一次，匹配行为不变。
+var (
+	cldiRe1 = regexp.MustCompile(`添加时间[:：]\s*(\d{4}-\d{2}-\d{2})`)
+	cldiRe2 = regexp.MustCompile(`\s+`)
+)

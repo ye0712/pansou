@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 	"html"
-	"io"
 	"net/http"
 	"net/url"
+	"pansou/util"
 	"regexp"
 	"strings"
 	"sync"
@@ -156,7 +156,7 @@ func (p *CygPlugin) fetchSearchResults(client *http.Client, searchURL string) ([
 	}
 
 	// 解析响应
-	body, err := io.ReadAll(resp.Body)
+	body, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
 	if err != nil {
 		return nil, fmt.Errorf("读取响应失败: %w", err)
 	}
@@ -247,7 +247,7 @@ func (p *CygPlugin) getDownloadLinks(client *http.Client, postID int) ([]model.L
 	}
 
 	// 解析响应
-	body, err := io.ReadAll(resp.Body)
+	body, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
 	if err != nil {
 		return nil, fmt.Errorf("读取下载链接响应失败: %w", err)
 	}
@@ -388,7 +388,14 @@ func (p *CygPlugin) doRequestWithRetry(req *http.Request, client *http.Client) (
 		}
 
 		if resp != nil {
+			status := resp.StatusCode
 			resp.Body.Close()
+			if err == nil {
+				// Do 成功但状态码非 200。此前这里只执行 lastErr = err，
+				// err 为 nil 时会把 lastErr 清空，三次失败后仅报出
+				// "%!w(<nil>)"，真实状态码被丢掉、无法定位失败原因。
+				err = fmt.Errorf("HTTP 状态码 %d", status)
+			}
 		}
 		lastErr = err
 		if err == nil {
@@ -443,7 +450,7 @@ func (p *CygPlugin) cleanHTML(htmlContent string) string {
 	text = strings.TrimSpace(text)
 
 	// 替换多个空白字符为单个空格
-	text = regexp.MustCompile(`\s+`).ReplaceAllString(text, " ")
+	text = cygRe1.ReplaceAllString(text, " ")
 
 	return text
 }
@@ -471,3 +478,9 @@ func (p *CygPlugin) parseDateTime(dateStr string) time.Time {
 	// 解析失败时返回当前时间
 	return time.Now()
 }
+
+// 以下正则原先在函数内临时编译，每次调用都要重新解析模式；
+// 提到包级后只编译一次，匹配行为不变。
+var (
+	cygRe1 = regexp.MustCompile(`\s+`)
+)

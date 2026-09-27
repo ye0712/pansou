@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	stdjson "encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +13,7 @@ import (
 	"net/url"
 	"pansou/model"
 	"pansou/plugin"
+	"pansou/util"
 	"pansou/util/json"
 	"regexp"
 	"strings"
@@ -168,7 +168,7 @@ func (p *NSGameAsyncPlugin) searchImpl(client *http.Client, keyword string, ext 
 	}
 
 	// 6. 读取响应体
-	body, err := io.ReadAll(resp.Body)
+	body, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
 	if err != nil {
 		return nil, fmt.Errorf("[%s] 读取响应失败: %w", p.Name(), err)
 	}
@@ -264,7 +264,7 @@ func (p *NSGameAsyncPlugin) fetchDetail(client *http.Client, id int) (NSGameItem
 	}
 	defer resp.Body.Close()
 	var payload NSGameDetailResponse
-	if err := stdjson.NewDecoder(resp.Body).Decode(&payload); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		return NSGameItem{}, err
 	}
 	if !payload.Success || payload.Data.ID == 0 {
@@ -365,18 +365,40 @@ func (p *NSGameAsyncPlugin) postSessionRaw(client *http.Client, path string, bod
 		return nil, fmt.Errorf("[%s] 会话请求失败: %w", p.Name(), err)
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
+	// 先判状态码再读体：非 200 的响应体本来就要丢弃，先读它既浪费又可能因为
+	// 错误页过大而报出"响应过大"，把真正有用的状态码盖掉。
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("[%s] 会话返回状态码: %d", p.Name(), resp.StatusCode)
+	}
+	// 原先这里写的是 data, _ := ...：读体失败被丢弃，于是"半截 data + nil error"会被
+	// 当成成功返回，调用方拿到的是被截断的会话数据却毫无察觉。
+	data, readErr := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
+	if readErr != nil {
+		return nil, fmt.Errorf("[%s] 读取会话响应失败: %w", p.Name(), readErr)
 	}
 	return data, nil
 }
 
+// maxChallengeBits 是 sha256 摘要的位数，也是难度位的合法上界。
+const maxChallengeBits = 256
+
 func solveChallenge(challenge string, difficultyBits int) string {
+	// difficultyBits 直接来自第三方响应的 JSON（见 nsgameChallengeData），此前没有任何
+	// 边界校验：它是"摘要前缀零位数"，而 sum 是 [32]byte。difficultyBits >= 256 时
+	// fullBytes >= 32，下面 sum[i] 与 sum[fullBytes] 都会越界 panic；这跑在
+	// AsyncSearchWithResult 起的 goroutine 里（plugin.go:950），该 goroutine 没有
+	// recover，越界不是单次请求失败而是整个进程退出。负数则会让 fullBytes 为负、
+	// 循环不执行而静默返回错误 nonce，所以一并挡掉。
+	if difficultyBits < 0 || difficultyBits > maxChallengeBits {
+		return ""
+	}
 	for nonce := int64(0); nonce < 10000000; nonce++ {
 		sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%d", challenge, nonce)))
 		fullBytes, remainder := difficultyBits/8, difficultyBits%8
 		valid := true
+		if fullBytes > len(sum) {
+			return ""
+		}
 		for i := 0; i < fullBytes; i++ {
 			if sum[i] != 0 {
 				valid = false
@@ -499,7 +521,14 @@ func (p *NSGameAsyncPlugin) doRequestWithRetry(req *http.Request, client *http.C
 		}
 
 		if resp != nil {
+			status := resp.StatusCode
 			resp.Body.Close()
+			if err == nil {
+				// Do 成功但状态码非 200。此前这里只执行 lastErr = err，
+				// err 为 nil 时会把 lastErr 清空，三次失败后仅报出
+				// "%!w(<nil>)"，真实状态码被丢掉、无法定位失败原因。
+				err = fmt.Errorf("HTTP 状态码 %d", status)
+			}
 		}
 		lastErr = err
 		if lastErr == nil {

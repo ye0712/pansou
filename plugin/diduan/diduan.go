@@ -3,10 +3,10 @@ package diduan
 import (
 	"encoding/base64"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"net/url"
+	"pansou/util"
 	"regexp"
 	"strings"
 	"sync"
@@ -336,7 +336,7 @@ func (p *DiduanPlugin) parseResultItem(s *goquery.Selection, index int) *model.S
 // extractPostID 从文章class中提取文章ID
 func (p *DiduanPlugin) extractPostID(articleClass string) string {
 	// 匹配 post-{数字} 格式
-	re := regexp.MustCompile(`post-(\d+)`)
+	re := diduanRe1
 	matches := re.FindStringSubmatch(articleClass)
 	if len(matches) > 1 {
 		return matches[1]
@@ -494,7 +494,7 @@ func (p *DiduanPlugin) fetchDetailPageLinks(detailURL string) []model.Link {
 	}
 
 	// 读取响应体
-	body, err := io.ReadAll(resp.Body)
+	body, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
 	if err != nil {
 		if p.debugMode {
 			log.Printf("[DIDUAN] 读取详情页响应失败: %v", err)
@@ -669,3 +669,9 @@ func (p *DiduanPlugin) determineCloudType(url string) string {
 		return "others"
 	}
 }
+
+// 以下正则原先在函数内临时编译，每次调用都要重新解析模式；
+// 提到包级后只编译一次，匹配行为不变。
+var (
+	diduanRe1 = regexp.MustCompile(`post-(\d+)`)
+)

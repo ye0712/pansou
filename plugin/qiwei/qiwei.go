@@ -5,7 +5,6 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -18,6 +17,7 @@ import (
 	"github.com/PuerkitoBio/goquery"
 	"pansou/model"
 	"pansou/plugin"
+	"pansou/util"
 	"pansou/util/json"
 )
 
@@ -104,6 +104,7 @@ func init() {
 
 func NewQiweiPlugin() *QiweiPlugin {
 	transport := &http.Transport{
+		Proxy:               util.ProxyFuncForTransport(),
 		MaxIdleConns:        120,
 		MaxIdleConnsPerHost: 24,
 		MaxConnsPerHost:     36,
@@ -395,7 +396,7 @@ func (p *QiweiPlugin) solveVerification(client *http.Client, pageURL, verifyHTML
 		return fmt.Errorf("提交验证失败: %w", err)
 	}
 	defer resp.Body.Close()
-	responseBody, err := io.ReadAll(resp.Body)
+	responseBody, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
 	if err != nil {
 		return fmt.Errorf("读取验证响应失败: %w", err)
 	}
@@ -628,7 +629,7 @@ func (p *QiweiPlugin) fetchBody(client *http.Client, requestURL, referer string,
 		return "", fmt.Errorf("[%s] HTTP状态码异常: %d url=%s", p.Name(), resp.StatusCode, requestURL)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
 	if err != nil {
 		return "", fmt.Errorf("[%s] 读取响应失败: %w", p.Name(), err)
 	}
@@ -650,7 +651,14 @@ func (p *QiweiPlugin) doRequestWithRetry(req *http.Request, client *http.Client)
 			return resp, nil
 		}
 		if resp != nil {
+			status := resp.StatusCode
 			resp.Body.Close()
+			if err == nil {
+				// Do 成功但状态码非 200。此前这里只执行 lastErr = err，
+				// err 为 nil 时会把 lastErr 清空，三次失败后仅报出
+				// "%!w(<nil>)"，真实状态码被丢掉、无法定位失败原因。
+				err = fmt.Errorf("HTTP 状态码 %d", status)
+			}
 		}
 		lastErr = err
 	}

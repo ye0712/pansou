@@ -2,10 +2,10 @@ package u3c3
 
 import (
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"net/url"
+	"pansou/util"
 	"regexp"
 	"strings"
 	"sync"
@@ -169,7 +169,7 @@ func (p *U3c3Plugin) getSearch2Parameter() (string, error) {
 		if lastErr != nil || resp == nil || resp.StatusCode != 200 {
 			continue
 		}
-		body, readErr := io.ReadAll(resp.Body)
+		body, readErr := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
 		resp.Body.Close()
 		if readErr != nil {
 			lastErr = readErr
@@ -215,7 +215,7 @@ func (p *U3c3Plugin) extractSearch2FromHTML(html string) string {
 		// 查找包含nmefafej的行
 		if strings.Contains(line, "nmefafej") && strings.Contains(line, `"`) {
 			// 使用正则提取引号内的值
-			re := regexp.MustCompile(`var\s+nmefafej\s*=\s*"([^"]+)"`)
+			re := u3c3Re1
 			matches := re.FindStringSubmatch(line)
 			if len(matches) > 1 && len(matches[1]) > 5 {
 				if p.debugMode {
@@ -297,7 +297,7 @@ func (p *U3c3Plugin) doSearch(keyword, search2 string) ([]model.SearchResult, er
 		return nil, fmt.Errorf("搜索请求失败，状态码: %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -403,9 +403,9 @@ func (p *U3c3Plugin) parseSearchResults(html string) ([]model.SearchResult, erro
 // cleanTitle 清理标题文本
 func (p *U3c3Plugin) cleanTitle(title string) string {
 	// 移除HTML标签
-	title = regexp.MustCompile(`<[^>]*>`).ReplaceAllString(title, "")
+	title = u3c3Re2.ReplaceAllString(title, "")
 	// 移除多余的空白字符
-	title = regexp.MustCompile(`\s+`).ReplaceAllString(title, " ")
+	title = u3c3Re3.ReplaceAllString(title, " ")
 	// 移除前后空白
 	title = strings.TrimSpace(title)
 	return title
@@ -448,3 +448,11 @@ func (p *U3c3Plugin) generateUniqueID(title, size string) string {
 	}
 	return fmt.Sprintf("u3c3-%d", hash)
 }
+
+// 以下正则原先在函数内临时编译，每次调用都要重新解析模式；
+// 提到包级后只编译一次，匹配行为不变。
+var (
+	u3c3Re1 = regexp.MustCompile(`var\s+nmefafej\s*=\s*"([^"]+)"`)
+	u3c3Re2 = regexp.MustCompile(`<[^>]*>`)
+	u3c3Re3 = regexp.MustCompile(`\s+`)
+)

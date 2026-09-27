@@ -3,12 +3,12 @@ package kpkuang
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"html"
 	"io"
 	"net/http"
 	"net/url"
+	utiljson "pansou/util/json"
 	"regexp"
 	"strconv"
 	"strings"
@@ -52,7 +52,7 @@ type KpkuangPlugin struct {
 }
 
 type betaItem struct {
-	ID   json.RawMessage `json:"id"`
+	ID   utiljson.RawMessage `json:"id"`
 	Data struct {
 		Name       string `json:"vod_name"`
 		Original   string `json:"vod_name_org"`
@@ -181,7 +181,7 @@ func parseBetaResponse(body []byte) ([]searchItem, error) {
 		return nil, fmt.Errorf("无效的 beta JSONP 响应")
 	}
 	var envelope betaResponse
-	if err := json.Unmarshal(body[start:end+1], &envelope); err != nil {
+	if err := utiljson.Unmarshal(body[start:end+1], &envelope); err != nil {
 		return nil, err
 	}
 	if envelope.Code != 1 || strings.TrimSpace(envelope.JS) == "" {
@@ -192,7 +192,7 @@ func parseBetaResponse(body []byte) ([]searchItem, error) {
 		return nil, err
 	}
 	var rawItems []betaItem
-	if err := json.Unmarshal(decoded, &rawItems); err != nil {
+	if err := utiljson.Unmarshal(decoded, &rawItems); err != nil {
 		return nil, err
 	}
 	items := make([]searchItem, 0, len(rawItems))
@@ -649,13 +649,13 @@ func resolveURL(raw, base string) string {
 	return baseURL.ResolveReference(parsed).String()
 }
 
-func rawID(raw json.RawMessage) string {
+func rawID(raw utiljson.RawMessage) string {
 	var value string
-	if json.Unmarshal(raw, &value) == nil {
+	if utiljson.Unmarshal(raw, &value) == nil {
 		return strings.TrimSpace(value)
 	}
-	var number json.Number
-	if json.Unmarshal(raw, &number) == nil {
+	var number utiljson.Number
+	if utiljson.Unmarshal(raw, &number) == nil {
 		return number.String()
 	}
 	return ""
@@ -696,7 +696,7 @@ func detailContent(meta map[string]string) string {
 
 func cleanTitle(value string) string {
 	value = cleanText(value)
-	value = regexp.MustCompile(`\s*\(\d{4}\)\s*$`).ReplaceAllString(value, "")
+	value = kpkuangRe1.ReplaceAllString(value, "")
 	return strings.TrimSpace(value)
 }
 
@@ -739,3 +739,9 @@ func shortID(value string) string {
 	}
 	return strconv.FormatUint(uint64(hash), 16)
 }
+
+// 以下正则原先在函数内临时编译，每次调用都要重新解析模式；
+// 提到包级后只编译一次，匹配行为不变。
+var (
+	kpkuangRe1 = regexp.MustCompile(`\s*\(\d{4}\)\s*$`)
+)

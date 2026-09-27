@@ -3,11 +3,11 @@ package djgou
 import (
 	"context"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"pansou/model"
 	"pansou/plugin"
+	"pansou/util"
 	"regexp"
 	"strings"
 	"sync"
@@ -79,6 +79,7 @@ type DjgouPlugin struct {
 // createOptimizedHTTPClient 创建优化的HTTP客户端
 func createOptimizedHTTPClient() *http.Client {
 	transport := &http.Transport{
+		Proxy:               util.ProxyFuncForTransport(),
 		MaxIdleConns:        MaxIdleConns,
 		MaxIdleConnsPerHost: MaxIdleConnsPerHost,
 		MaxConnsPerHost:     MaxConnsPerHost,
@@ -146,7 +147,7 @@ func (p *DjgouPlugin) searchImpl(client *http.Client, keyword string, ext map[st
 	}
 
 	// 6. 读取并解析搜索结果页面。部分节点先返回 BTWAF JS 跳转页。
-	body, err := io.ReadAll(resp.Body)
+	body, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
 	resp.Body.Close()
 	if err != nil {
 		return nil, fmt.Errorf("[%s] 读取搜索页面失败: %w", p.Name(), err)
@@ -166,10 +167,17 @@ func (p *DjgouPlugin) searchImpl(client *http.Client, keyword string, ext map[st
 				challengeReq.Header = req.Header.Clone()
 				challengeResp, doErr := p.doRequestWithRetry(challengeReq, client)
 				if doErr == nil {
-					challengeBody, readErr := io.ReadAll(challengeResp.Body)
+					challengeBody, readErr := util.ReadAllLimited(challengeResp.Body, util.MaxUpstreamResponseBytes)
 					challengeResp.Body.Close()
 					if readErr == nil {
-						doc, _ = goquery.NewDocumentFromReader(strings.NewReader(string(challengeBody)))
+						// 解析失败原先被丢弃：doc 会留在半截状态，后续用它找挑战字段
+						// 只会得到"没找到"，与"页面里确实没有挑战"无法区分。
+						parsedDoc, parseErr := goquery.NewDocumentFromReader(strings.NewReader(string(challengeBody)))
+						if parseErr != nil {
+							fmt.Printf("[DIGOU] 挑战页解析失败: %v\n", parseErr)
+						} else {
+							doc = parsedDoc
+						}
 					}
 				}
 			}
@@ -447,7 +455,7 @@ func (p *DjgouPlugin) extractContent(mainContent *goquery.Selection) string {
 	content := strings.TrimSpace(mainContent.Text())
 
 	// 清理空白字符
-	content = regexp.MustCompile(`\s+`).ReplaceAllString(content, " ")
+	content = djgouRe1.ReplaceAllString(content, " ")
 
 	// 限制长度
 	if len(content) > 300 {
@@ -478,10 +486,23 @@ func (p *DjgouPlugin) doRequestWithRetry(req *http.Request, client *http.Client)
 		}
 
 		if resp != nil {
+			status := resp.StatusCode
 			resp.Body.Close()
+			if err == nil {
+				// Do 成功但状态码非 200。此前这里只执行 lastErr = err，
+				// err 为 nil 时会把 lastErr 清空，三次失败后仅报出
+				// "%!w(<nil>)"，真实状态码被丢掉、无法定位失败原因。
+				err = fmt.Errorf("HTTP 状态码 %d", status)
+			}
 		}
 		lastErr = err
 	}
 
 	return nil, fmt.Errorf("重试 %d 次后仍然失败: %w", maxRetries, lastErr)
 }
+
+// 以下正则原先在函数内临时编译，每次调用都要重新解析模式；
+// 提到包级后只编译一次，匹配行为不变。
+var (
+	djgouRe1 = regexp.MustCompile(`\s+`)
+)

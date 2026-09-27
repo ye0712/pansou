@@ -17,6 +17,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"pansou/util"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -32,11 +33,14 @@ import (
 	"pansou/util/json"
 )
 
+// DefaultBaseURL 是站点根地址。声明为变量而非常量，是为了让测试能指向本地假服务器，
+// 从而验证重试与中止语义，而不是只能靠肉眼看代码。
+var DefaultBaseURL = "https://pinglian.lol"
+
 const (
 	PluginName        = "panlian"
 	DisplayName       = "盘链"
 	Description       = "盘链 - 登录后检索影视资源并聚合网盘链接"
-	DefaultBaseURL    = "https://pinglian.lol"
 	ConfigFileName    = "panlian_config.json"
 	RequestTimeout    = 20 * time.Second
 	MaxConcurrentJobs = 4
@@ -230,6 +234,19 @@ const htmlTemplate = `<!DOCTYPE html>
     @keyframes spin {
       to { transform: rotate(360deg); }
     }
+    .captcha-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .captcha-row img {
+      height: 38px;
+      border-radius: 6px;
+      border: 1px solid rgba(148, 163, 184, 0.35);
+      cursor: pointer;
+      background: #fff;
+    }
   </style>
 </head>
 <body>
@@ -259,9 +276,21 @@ const htmlTemplate = `<!DOCTYPE html>
           <label for="password">密码</label>
           <input id="password" type="password" autocomplete="current-password">
         </div>
+        <div>
+          <label for="captcha">图形验证码</label>
+          <div class="captcha-row">
+            <input id="captcha" autocomplete="off" placeholder="输入图中字符">
+            <img id="captchaImg" alt="点击刷新验证码" title="点击刷新验证码" onclick="refreshCaptcha()">
+          </div>
+        </div>
+        <div id="emailRow" class="hidden">
+          <label for="loginEmail">账号绑定的邮箱</label>
+          <input id="loginEmail" autocomplete="email" placeholder="用于站点确认本人操作">
+        </div>
       </div>
       <div class="actions">
         <button type="button" onclick="login()">登录并保存</button>
+        <button type="button" onclick="confirmEmail()">确认邮箱并完成登录</button>
       </div>
     </div>
 
@@ -349,14 +378,85 @@ const htmlTemplate = `<!DOCTYPE html>
       }
     }
 
+    let captchaId = "";
+    let confirmId = "";
+
+    async function refreshCaptcha() {
+      try {
+        const result = await postAction("captcha", {});
+        if (result.success && result.data) {
+          captchaId = result.data.captcha_id || "";
+          document.getElementById("captcha").value = "";
+          document.getElementById("captchaImg").src = result.data.image || "";
+        } else {
+          showResult(result);
+        }
+      } catch (error) {
+        showError(error);
+      }
+    }
+
     async function login() {
       try {
         const username = document.getElementById("username").value.trim();
         const password = document.getElementById("password").value;
-        const result = await postAction("login", { username, password, remember: true });
+        const captchaCode = document.getElementById("captcha").value.trim();
+        if (!captchaId) {
+          await refreshCaptcha();
+          showError("验证码已刷新，请按图中字符填写");
+          return;
+        }
+        const result = await postAction("login", {
+          username, password, remember: true, captcha_id: captchaId, captcha_code: captchaCode
+        });
         showResult(result);
+        if (result.success && result.data && result.data.need_email) {
+          confirmId = result.data.confirm_id || "";
+          const row = document.getElementById("emailRow");
+          row.classList.remove("hidden");
+          const hint = result.data.email_hint;
+          if (hint) {
+            document.getElementById("loginEmail").placeholder = "账号邮箱（站点提示 " + hint + "）";
+          }
+          return;
+        }
         if (result.success) {
           document.getElementById("password").value = "";
+          document.getElementById("emailRow").classList.add("hidden");
+          await refreshCaptcha();
+          await loadStatus();
+          return;
+        }
+        if (result.data && result.data.captcha_required) {
+          await refreshCaptcha();
+        }
+      } catch (error) {
+        showError(error);
+      }
+    }
+
+    async function confirmEmail() {
+      try {
+        const username = document.getElementById("username").value.trim();
+        const password = document.getElementById("password").value;
+        const email = document.getElementById("loginEmail").value.trim();
+        if (!confirmId) {
+          showError("请先完成上一步登录（账号、密码、图形验证码）");
+          return;
+        }
+        if (!email) {
+          showError("请输入该账号绑定的邮箱");
+          return;
+        }
+        const result = await postAction("confirm_email", {
+          username, password, remember: true, confirm_id: confirmId, email
+        });
+        showResult(result);
+        if (result.success) {
+          confirmId = "";
+          document.getElementById("password").value = "";
+          document.getElementById("emailRow").classList.add("hidden");
+          await refreshCaptcha();
           await loadStatus();
         }
       } catch (error) {
@@ -399,7 +499,10 @@ const htmlTemplate = `<!DOCTYPE html>
       }
     }
 
-    window.onload = loadStatus;
+    window.onload = async () => {
+      await loadStatus();
+      await refreshCaptcha();
+    };
   </script>
 </body>
 </html>`
@@ -430,10 +533,19 @@ type User struct {
 }
 
 type LoginResponse struct {
-	Success bool      `json:"success"`
-	Message string    `json:"message"`
-	Data    LoginUser `json:"data"`
-	User    struct {
+	Success   bool      `json:"success"`
+	Message   string    `json:"message"`
+	ErrorType string    `json:"error_type"`
+	Data      LoginUser `json:"data"`
+	// Details 承载站点新增的校验信息：图形验证码是否错误、是否需要邮箱二次确认。
+	// 站点自 2026 年起登录必须过图形验证码，且还要输入一次账号绑定的邮箱。
+	Details struct {
+		CaptchaError        bool   `json:"captcha_error"`
+		ConfirmID           string `json:"confirm_id"`
+		Email               string `json:"email"`
+		EmailVerifyRequired bool   `json:"email_verify_required"`
+	} `json:"details"`
+	User struct {
 		ID         int    `json:"id"`
 		Username   string `json:"username"`
 		Email      string `json:"email"`
@@ -450,6 +562,33 @@ type LoginUser struct {
 	MustChangePassword bool   `json:"must_change_password"`
 	FilesAllowed       bool   `json:"files_allowed"`
 	MountAllowed       bool   `json:"mount_allowed"`
+}
+
+// CaptchaResponse 对应站点 GET /api/auth/captcha：返回验证码 id 与 base64 图片。
+// 该接口不需要 Cookie（id 本身就是后续登录的参数），所以插件侧无需保存会话状态。
+type CaptchaResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+	Data    struct {
+		ID    string `json:"id"`
+		Image string `json:"image"`
+	} `json:"data"`
+}
+
+// 站点每次登录都要图形验证码，机器人无法自行识别，必须由用户在界面上填写。
+var (
+	errCaptchaRequired = errors.New("站点要求图形验证码")
+	errCaptchaInvalid  = errors.New("图形验证码错误")
+)
+
+// loginAttempt 描述一次登录尝试：要么直接成功（带回 Cookie），
+// 要么停在"请输入账号绑定的邮箱"这一步（带回 confirm_id 与站点给的掩码邮箱提示）。
+type loginAttempt struct {
+	NeedEmail bool
+	ConfirmID string
+	EmailHint string
+	Cookie    string
+	Username  string
 }
 
 type VideoSearchResponse struct {
@@ -470,17 +609,22 @@ type VideoSearchResponse struct {
 }
 
 type VideoItem struct {
-	ID          int    `json:"id"`
-	Title       string `json:"title"`
-	Alias       string `json:"alias"`
-	Cover       string `json:"cover"`
-	Intro       string `json:"intro"`
-	Year        string `json:"year"`
-	Area        string `json:"area"`
-	Lang        string `json:"lang"`
-	Remarks     string `json:"remarks"`
-	Score       string `json:"score"`
-	Type        string `json:"type_name"`
+	ID      int    `json:"id"`
+	Title   string `json:"title"`
+	Alias   string `json:"alias"`
+	Cover   string `json:"cover"`
+	Intro   string `json:"intro"`
+	Year    string `json:"year"`
+	Area    string `json:"area"`
+	Lang    string `json:"lang"`
+	Remarks string `json:"remarks"`
+	Score   string `json:"score"`
+	// 注意：这里必须是 "type" 而不是 "type_name"。
+	// 同层出现两个相同的 json tag 时，encoding/json 与本项目实际使用的 sonic
+	// （pansou/util/json）行为一致：**两个字段全部忽略且不报错**（实测确认，
+	// 见 panlian_jsontag_test.go）。于是接口返回的 type_name 谁也没接住，
+	// 下面 normalize 里的 firstNonEmpty(TypeName, Type) 也就永远落空。
+	Type        string `json:"type"`
 	Actor       string `json:"actor"`
 	DirectorNew string `json:"director"`
 
@@ -665,7 +809,7 @@ func (p *PanlianPlugin) searchWithUser(client *http.Client, user *User, keyword 
 	results, err := p.searchOnce(client, user, keyword)
 	if err == nil {
 		user.LastAccessAt = time.Now()
-		_ = p.saveUser(user)
+		p.saveUserOrLog(user)
 		return results, nil
 	}
 
@@ -675,7 +819,7 @@ func (p *PanlianPlugin) searchWithUser(client *http.Client, user *User, keyword 
 	if user.EncryptedPassword == "" || user.Username == "" {
 		user.Status = "expired"
 		user.Cookie = ""
-		_ = p.saveUser(user)
+		p.saveUserOrLog(user)
 		return nil, err
 	}
 
@@ -1261,14 +1405,25 @@ func (p *PanlianPlugin) doJSONGET(client *http.Client, cookie string, path strin
 		targetURL += "?" + values.Encode()
 	}
 
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
+	var ok bool
+
+	// 重试逻辑收敛到 util.DoWithRetry。这处有两类"重试没有意义"的错误，用 util.Abort 中止：
+	// 登录失效（cookie 过期，再试还是失效）与响应格式不对（再试还是不对）。
+	// 退避是**线性**的（(attempt+1) × 200ms），用 DelayFunc 原样表达。
+	err := util.DoWithRetry(util.RetryConfig{
+		Attempts: 3,
+		DelayFunc: func(attempt int) time.Duration {
+			return time.Duration(attempt+1) * 200 * time.Millisecond
+		},
+	}, func(_ int) error {
 		ctx, cancel := context.WithTimeout(context.Background(), RequestTimeout)
+		defer cancel()
+
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 		if err != nil {
-			cancel()
-			return err
+			return util.Abort(err) // 建请求就失败，重试没意义
 		}
+
 		req.Header.Set("User-Agent", browserUserAgent())
 		req.Header.Set("X-Requested-With", "XMLHttpRequest")
 		req.Header.Set("Accept", "application/json, text/plain, */*")
@@ -1281,38 +1436,35 @@ func (p *PanlianPlugin) doJSONGET(client *http.Client, cookie string, path strin
 
 		resp, err := client.Do(req)
 		if err != nil {
-			cancel()
-			lastErr = err
-			time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
-			continue
+			return err
 		}
-
-		body, readErr := io.ReadAll(resp.Body)
+		body, readErr := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
 		resp.Body.Close()
-		cancel()
 		if readErr != nil {
-			lastErr = readErr
-			time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
-			continue
+			return readErr
 		}
 		if resp.StatusCode != http.StatusOK {
 			if resp.StatusCode == http.StatusUnauthorized || bytes.Contains(bytes.ToLower(body), []byte("请先登录")) || bytes.Contains(bytes.ToLower(body), []byte("admin_auth_required")) {
-				return fmt.Errorf("%w: HTTP %d", errLoginRequired, resp.StatusCode)
+				return util.Abort(fmt.Errorf("%w: HTTP %d", errLoginRequired, resp.StatusCode))
 			}
-			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
-			time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
-			continue
+			return fmt.Errorf("HTTP %d", resp.StatusCode)
 		}
 		if err := json.Unmarshal(body, out); err != nil {
 			if bytes.Contains(body, []byte("请先登录")) || bytes.Contains(body, []byte("login")) {
-				return fmt.Errorf("%w: %s", errLoginRequired, string(body))
+				return util.Abort(fmt.Errorf("%w: %s", errLoginRequired, string(body)))
 			}
-			return fmt.Errorf("解析接口响应失败: %w", err)
+			return util.Abort(fmt.Errorf("解析接口响应失败: %w", err))
 		}
+		ok = true
 		return nil
+	})
+	if err != nil {
+		return err
 	}
-
-	return lastErr
+	if !ok {
+		return fmt.Errorf("请求未成功")
+	}
+	return nil
 }
 
 func (p *PanlianPlugin) doJSONPOST(client *http.Client, cookie string, path string, payload []byte, out interface{}) error {
@@ -1349,10 +1501,13 @@ func (p *PanlianPlugin) doJSONPOST(client *http.Client, cookie string, path stri
 	return nil
 }
 
-func (p *PanlianPlugin) doLogin(username string, password string, remember bool) (string, *LoginResponse, error) {
+func (p *PanlianPlugin) doLogin(username string, password string, remember bool, captchaID string, captchaCode string) (*loginAttempt, error) {
 	username = strings.TrimSpace(username)
 	if username == "" || password == "" {
-		return "", nil, fmt.Errorf("账号和密码不能为空")
+		return nil, fmt.Errorf("账号和密码不能为空")
+	}
+	if strings.TrimSpace(captchaID) == "" || strings.TrimSpace(captchaCode) == "" {
+		return nil, errCaptchaRequired
 	}
 	jar, _ := cookiejar.New(nil)
 	client := &http.Client{
@@ -1366,72 +1521,178 @@ func (p *PanlianPlugin) doLogin(username string, password string, remember bool)
 	if remember {
 		form.Set("remember", "1")
 	}
+	form.Set("captcha_id", strings.TrimSpace(captchaID))
+	form.Set("captcha_code", strings.TrimSpace(captchaCode))
 
 	ctx, cancel := context.WithTimeout(context.Background(), RequestTimeout)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, DefaultBaseURL+"/api/auth/login", strings.NewReader(form.Encode()))
 	if err != nil {
 		cancel()
-		return "", nil, err
+		return nil, err
 	}
 	p.setPanlianHeaders(req, "", DefaultBaseURL+"/login")
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 
 	resp, err := client.Do(req)
 	if err != nil {
 		cancel()
-		return "", nil, err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
 	cancel()
 	if err != nil {
-		return "", nil, err
+		return nil, err
 	}
-	if resp.StatusCode != http.StatusOK {
-		return "", nil, fmt.Errorf("登录请求失败: HTTP %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusBadRequest {
+		// 站点用 400 + JSON 表达"验证码错/需要邮箱确认"，所以 400 不是异常。
+		return nil, fmt.Errorf("登录请求失败: HTTP %d", resp.StatusCode)
 	}
 
 	var loginResp LoginResponse
 	if err := json.Unmarshal(respBody, &loginResp); err != nil {
-		return "", nil, fmt.Errorf("解析登录响应失败: %w", err)
+		return nil, fmt.Errorf("解析登录响应失败: %w", err)
 	}
+
 	if !loginResp.Success {
+		if loginResp.Details.CaptchaError || strings.Contains(loginResp.Message, "验证码") {
+			return nil, errCaptchaInvalid
+		}
+		if loginResp.Details.EmailVerifyRequired && loginResp.Details.ConfirmID != "" {
+			return &loginAttempt{
+				NeedEmail: true,
+				ConfirmID: loginResp.Details.ConfirmID,
+				EmailHint: loginResp.Details.Email,
+			}, nil
+		}
 		message := strings.TrimSpace(loginResp.Message)
 		if message == "" {
 			message = "登录失败"
 		}
-		return "", nil, errors.New(message)
+		return nil, errors.New(message)
 	}
 
 	baseURL, _ := url.Parse(DefaultBaseURL)
 	cookieString := cookiesToString(jar.Cookies(baseURL))
 	if cookieString == "" {
-		return "", nil, fmt.Errorf("登录成功但未获取到有效 Cookie")
+		return nil, fmt.Errorf("登录成功但未获取到有效 Cookie")
 	}
 
-	return cookieString, &loginResp, nil
+	return &loginAttempt{
+		Cookie:   cookieString,
+		Username: firstNonEmpty(loginResp.Data.Username, loginResp.User.Username, username),
+	}, nil
+}
+
+// fetchCaptcha 取一张新的图形验证码，返回 (id, base64 图片 data URL)。
+func (p *PanlianPlugin) fetchCaptcha() (string, string, error) {
+	client := &http.Client{Timeout: RequestTimeout}
+	ctx, cancel := context.WithTimeout(context.Background(), RequestTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, DefaultBaseURL+"/api/auth/captcha", nil)
+	if err != nil {
+		return "", "", err
+	}
+	p.setPanlianHeaders(req, "", DefaultBaseURL+"/login")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
+	if err != nil {
+		return "", "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("获取验证码失败: HTTP %d", resp.StatusCode)
+	}
+	var cr CaptchaResponse
+	if err := json.Unmarshal(body, &cr); err != nil {
+		return "", "", fmt.Errorf("解析验证码响应失败: %w", err)
+	}
+	if !cr.Success || cr.Data.ID == "" || cr.Data.Image == "" {
+		return "", "", errors.New(firstNonEmpty(cr.Message, "站点未返回验证码"))
+	}
+	return cr.Data.ID, cr.Data.Image, nil
+}
+
+// confirmEmailLogin 完成登录第二步：提交 confirm_id 与账号绑定的邮箱。
+// 站点校对通过后直接下发 admin_session Cookie，整个登录即完成（不需要收邮箱里的验证码）。
+func (p *PanlianPlugin) confirmEmailLogin(confirmID string, email string, remember bool) (string, string, error) {
+	confirmID = strings.TrimSpace(confirmID)
+	email = strings.TrimSpace(email)
+	if confirmID == "" || email == "" {
+		return "", "", fmt.Errorf("缺少确认标识或邮箱")
+	}
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{
+		Timeout: RequestTimeout,
+		Jar:     jar,
+	}
+
+	form := url.Values{}
+	form.Set("confirm_id", confirmID)
+	form.Set("email", email)
+	if remember {
+		form.Set("remember", "1")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), RequestTimeout)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, DefaultBaseURL+"/api/auth/login/confirm-email", strings.NewReader(form.Encode()))
+	if err != nil {
+		cancel()
+		return "", "", err
+	}
+	p.setPanlianHeaders(req, "", DefaultBaseURL+"/login")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		cancel()
+		return "", "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
+	cancel()
+	if err != nil {
+		return "", "", err
+	}
+	var cr LoginResponse
+	if err := json.Unmarshal(body, &cr); err != nil {
+		return "", "", fmt.Errorf("解析邮箱确认响应失败: %w", err)
+	}
+	if !cr.Success {
+		message := strings.TrimSpace(cr.Message)
+		if message == "" {
+			message = "邮箱确认失败"
+		}
+		return "", "", errors.New(message)
+	}
+
+	baseURL, _ := url.Parse(DefaultBaseURL)
+	cookieString := cookiesToString(jar.Cookies(baseURL))
+	if cookieString == "" {
+		return "", "", fmt.Errorf("邮箱确认通过但未获取到有效 Cookie")
+	}
+	return cookieString, firstNonEmpty(cr.Data.Username, cr.User.Username), nil
 }
 
 func (p *PanlianPlugin) reloginUser(user *User) error {
-	password, err := p.decryptPassword(user.EncryptedPassword)
-	if err != nil {
-		return err
-	}
-	cookie, _, err := p.doLogin(user.Username, password, true)
-	if err != nil {
-		user.Status = "expired"
-		user.Cookie = ""
-		_ = p.saveUser(user)
-		return err
-	}
-
-	user.Cookie = cookie
-	user.Status = "active"
-	user.LoginAt = time.Now()
-	user.ExpireAt = time.Now().Add(30 * 24 * time.Hour)
-	user.LastAccessAt = time.Now()
-	return p.saveUser(user)
+	// 站点自 2026 年起每次登录都要求图形验证码（还要输一次账号绑定的邮箱），机器人无法自动通过，
+	// 所以"用保存的密码自动续期"这条路已经断了。这里把用户标记为过期，
+	// 交由用户在盘链管理页重新登录（会话 Cookie 有效期 30 天，正常使用不会频繁触发）。
+	user.Status = "expired"
+	user.Cookie = ""
+	p.saveUserOrLog(user)
+	return fmt.Errorf("站点登录已改为图形验证码 + 邮箱确认，无法自动续期，请在盘链管理里重新登录")
 }
 
 func (p *PanlianPlugin) handleManagePage(c *gin.Context) {
@@ -1464,6 +1725,10 @@ func (p *PanlianPlugin) handleManagePagePOST(c *gin.Context) {
 		p.handleGetStatus(c, hash)
 	case "login":
 		p.handleLogin(c, hash, reqData)
+	case "captcha":
+		p.handleCaptcha(c)
+	case "confirm_email":
+		p.handleConfirmEmail(c, hash, reqData)
 	case "logout":
 		p.handleLogout(c, hash)
 	case "update_config":
@@ -1484,10 +1749,10 @@ func (p *PanlianPlugin) handleGetStatus(c *gin.Context, hash string) {
 			CreatedAt:    time.Now(),
 			LastAccessAt: time.Now(),
 		}
-		_ = p.saveUser(user)
+		p.saveUserOrLog(user)
 	} else {
 		user.LastAccessAt = time.Now()
-		_ = p.saveUser(user)
+		p.saveUserOrLog(user)
 	}
 
 	loggedIn := user.Status == "active" && user.Cookie != ""
@@ -1515,17 +1780,41 @@ func (p *PanlianPlugin) handleLogin(c *gin.Context, hash string, reqData map[str
 	username, _ := reqData["username"].(string)
 	password, _ := reqData["password"].(string)
 	remember, _ := reqData["remember"].(bool)
+	captchaID, _ := reqData["captcha_id"].(string)
+	captchaCode, _ := reqData["captcha_code"].(string)
 	if strings.TrimSpace(username) == "" || password == "" {
 		respondError(c, "缺少用户名或密码")
 		return
 	}
 
-	cookie, loginResp, err := p.doLogin(username, password, remember || !reqDataHasKey(reqData, "remember"))
+	attempt, err := p.doLogin(username, password, remember || !reqDataHasKey(reqData, "remember"), captchaID, captchaCode)
 	if err != nil {
-		respondError(c, "登录失败: "+err.Error())
+		switch {
+		case errors.Is(err, errCaptchaRequired):
+			respondErrorData(c, "请先输入图形验证码", gin.H{"captcha_required": true})
+		case errors.Is(err, errCaptchaInvalid):
+			respondErrorData(c, "图形验证码错误或已过期，已为你换一张，请重新输入", gin.H{"captcha_required": true, "captcha_invalid": true})
+		default:
+			respondError(c, "登录失败: "+err.Error())
+		}
 		return
 	}
 
+	if attempt.NeedEmail {
+		// 停在第二步：让用户在界面上输入该账号绑定的邮箱。
+		respondSuccess(c, "为了确认是本人操作，请输入该账号绑定的邮箱", gin.H{
+			"need_email": true,
+			"confirm_id": attempt.ConfirmID,
+			"email_hint": attempt.EmailHint,
+		})
+		return
+	}
+
+	p.finishLogin(c, hash, strings.TrimSpace(username), password, attempt.Cookie, attempt.Username)
+}
+
+// finishLogin 把登录成功的结果落盘：加密保存密码与 Cookie，供后续搜索复用。
+func (p *PanlianPlugin) finishLogin(c *gin.Context, hash, username, password, cookie, loginUsername string) {
 	encryptedPassword, err := p.encryptPassword(password)
 	if err != nil {
 		respondError(c, "密码加密失败: "+err.Error())
@@ -1539,7 +1828,7 @@ func (p *PanlianPlugin) handleLogin(c *gin.Context, hash string, reqData map[str
 			CreatedAt: time.Now(),
 		}
 	}
-	user.Username = strings.TrimSpace(username)
+	user.Username = username
 	user.EncryptedPassword = encryptedPassword
 	user.Cookie = cookie
 	user.Status = "active"
@@ -1552,11 +1841,48 @@ func (p *PanlianPlugin) handleLogin(c *gin.Context, hash string, reqData map[str
 		return
 	}
 
-	loginUsername := firstNonEmpty(loginResp.Data.Username, loginResp.User.Username, username)
 	respondSuccess(c, "登录成功", gin.H{
-		"username": loginUsername,
+		"username": firstNonEmpty(loginUsername, username),
 		"status":   "active",
 	})
+}
+
+// handleCaptcha 取一张图形验证码交给前端显示；验证码由用户肉眼识别后回填。
+func (p *PanlianPlugin) handleCaptcha(c *gin.Context) {
+	id, image, err := p.fetchCaptcha()
+	if err != nil {
+		respondError(c, "获取验证码失败: "+err.Error())
+		return
+	}
+	respondSuccess(c, "", gin.H{
+		"captcha_id": id,
+		"image":      image,
+	})
+}
+
+// handleConfirmEmail 完成登录第二步：校验账号绑定的邮箱并落地会话。
+func (p *PanlianPlugin) handleConfirmEmail(c *gin.Context, hash string, reqData map[string]interface{}) {
+	confirmID, _ := reqData["confirm_id"].(string)
+	email, _ := reqData["email"].(string)
+	username, _ := reqData["username"].(string)
+	password, _ := reqData["password"].(string)
+	remember, _ := reqData["remember"].(bool)
+	if strings.TrimSpace(confirmID) == "" || strings.TrimSpace(email) == "" {
+		respondError(c, "缺少邮箱或确认标识，请重新登录")
+		return
+	}
+	if strings.TrimSpace(username) == "" || password == "" {
+		respondError(c, "缺少用户名或密码，请重新登录")
+		return
+	}
+
+	cookie, loginUsername, err := p.confirmEmailLogin(confirmID, email, remember || !reqDataHasKey(reqData, "remember"))
+	if err != nil {
+		respondErrorData(c, "邮箱确认失败: "+err.Error(), gin.H{"need_email": true, "confirm_id": confirmID})
+		return
+	}
+
+	p.finishLogin(c, hash, strings.TrimSpace(username), password, cookie, loginUsername)
 }
 
 func (p *PanlianPlugin) handleLogout(c *gin.Context, hash string) {
@@ -2121,6 +2447,15 @@ func respondError(c *gin.Context, message string) {
 	})
 }
 
+// respondErrorData 用于需要带结构化细节的失败：例如验证码错误时让前端自动换一张。
+func respondErrorData(c *gin.Context, message string, data interface{}) {
+	c.JSON(http.StatusOK, gin.H{
+		"success": false,
+		"message": message,
+		"data":    data,
+	})
+}
+
 func getEncryptionKey() []byte {
 	key := os.Getenv("PANLIAN_ENCRYPTION_KEY")
 	if key == "" {
@@ -2169,4 +2504,16 @@ func (p *PanlianPlugin) decryptPassword(encrypted string) (string, error) {
 		return "", err
 	}
 	return string(plaintext), nil
+}
+
+// saveUserOrLog 保存用户状态，失败时记录下来。
+//
+// 原先这几处都是 _ = p.saveUser(user)：内存状态已经更新，当前进程一切正常，
+// 但持久化失败时更改会在重启后丢失——新登录的用户会变回 pending、relogin 拿到的
+// cookie 会消失——而且没有任何线索。搜索本身已经成功，没法把错误回传给调用方，
+// 所以至少要让它在日志里可见。
+func (p *PanlianPlugin) saveUserOrLog(user *User) {
+	if err := p.saveUser(user); err != nil {
+		fmt.Printf("[PANLIAN] 保存用户状态失败（重启后可能丢失登录态）: %v\n", err)
+	}
 }
